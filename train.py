@@ -483,7 +483,7 @@ HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
 
 # Optimization
-TOTAL_BATCH_SIZE = 2**19 # ~524K tokens per optimizer step
+TOTAL_BATCH_SIZE = 2**19 # target ~524K tokens per optimizer step
 EMBEDDING_LR = 0.6      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.04        # learning rate for matrix parameters (Muon)
@@ -505,6 +505,8 @@ def _default_device_batch_size():
         return 128
     if total_gib >= 40:
         return 64
+    if total_gib >= 30:
+        return 48
     if total_gib >= 24:
         return 32
     return 8
@@ -623,12 +625,8 @@ num_flops_per_token = model.estimate_flops()
 print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
 tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-if TOTAL_BATCH_SIZE % tokens_per_fwdbwd != 0:
-    raise ValueError(
-        f"TOTAL_BATCH_SIZE ({TOTAL_BATCH_SIZE}) must be divisible by "
-        f"DEVICE_BATCH_SIZE*MAX_SEQ_LEN ({tokens_per_fwdbwd})."
-    )
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
+grad_accum_steps = max(1, int(TOTAL_BATCH_SIZE / tokens_per_fwdbwd + 0.5))
+effective_total_batch_size = grad_accum_steps * tokens_per_fwdbwd
 
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
@@ -646,6 +644,8 @@ train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train
 x, y, epoch = next(train_loader)  # prefetch first batch
 
 print(f"Time budget: {TIME_BUDGET}s")
+print(f"Target total batch size: {TOTAL_BATCH_SIZE:,}")
+print(f"Effective total batch size: {effective_total_batch_size:,}")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
 
 # Schedules (all based on progress = training_time / TIME_BUDGET)
