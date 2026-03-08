@@ -1,3 +1,13 @@
 commit	val_bpb	memory_gb	status	description
 b7c9ebb	0.997900	44.0	keep	baseline
 90a80f1	1.176055	8.6	keep	baseline as-is on RTX 5090
+d7c0c72	1.169933	16.6	keep	increase default batch on 24GB+ GPUs
+9934ac4	1.160494	24.5	keep	add 48-batch tier for 32GB GPUs
+59f7f07	1.405745	28.5	discard	raise 32GB microbatch tier to 56
+4dbdcb0	1.141957	24.5	keep	lower target batch for faster updates
+c9ffda3	1.121878	24.5	keep	lower target batch to 3-step accumulation
+16429b1	1.106631	24.5	keep	lower target batch to 2-step accumulation
+5b57979	1.092874	24.4	keep	lower target batch to 1-step accumulation
+6b520c7	1.099402	16.6	discard	lower 32GB microbatch tier back to 32
+3a07a00	1.095310	24.4	discard	shorten learning-rate warmdown
+b3b20b4	1.091506	24.4	keep	keep a nonzero learning-rate floor
