@@ -9,6 +9,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
+import subprocess
 import time
 from dataclasses import dataclass, asdict
 
@@ -514,17 +515,84 @@ DEVICE_BATCH_SIZE = int(os.environ.get("AUTORESEARCH_DEVICE_BATCH_SIZE", str(_de
 # Setup: tokenizer, model, optimizer, dataloader
 # ---------------------------------------------------------------------------
 
+CUDA_CORES_PER_SM = {
+    (7, 0): 64,   # Volta
+    (7, 5): 64,   # Turing
+    (8, 0): 64,   # A100
+    (8, 6): 128,  # RTX 30xx
+    (8, 9): 128,  # Ada / L4
+    (9, 0): 128,  # Hopper
+    (12, 0): 128, # Blackwell RTX
+}
+
+
+def _query_max_sm_clock_mhz(device_index=0):
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                f"--query-gpu=index,clocks.max.sm",
+                "--format=csv,noheader,nounits",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    for line in result.stdout.splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            index = int(parts[0])
+            clock_mhz = float(parts[1])
+        except ValueError:
+            continue
+        if index == device_index:
+            return clock_mhz
+    return None
+
+
+def estimate_device_peak_flops(device_index=0):
+    override = os.environ.get("AUTORESEARCH_PEAK_FLOPS")
+    if override is not None:
+        return float(override), f"env AUTORESEARCH_PEAK_FLOPS={override}"
+
+    props = torch.cuda.get_device_properties(device_index)
+    cc = (props.major, props.minor)
+    cuda_cores_per_sm = CUDA_CORES_PER_SM.get(cc)
+    max_sm_clock_mhz = _query_max_sm_clock_mhz(device_index)
+    if cuda_cores_per_sm is not None and max_sm_clock_mhz is not None:
+        peak_flops = (
+            props.multi_processor_count
+            * cuda_cores_per_sm
+            * 2
+            * max_sm_clock_mhz
+            * 1e6
+        )
+        label = (
+            f"{props.name} fp32 shader peak "
+            f"({props.multi_processor_count} SM x {cuda_cores_per_sm} cores/SM x "
+            f"{max_sm_clock_mhz:.0f} MHz x 2 FLOP/cycle)"
+        )
+        return peak_flops, label
+
+    fallback = 989.5e12
+    return fallback, f"fallback H100 tf32 peak (unsupported cc={cc}, set AUTORESEARCH_PEAK_FLOPS to override)"
+
 t_start = time.time()
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+PEAK_FLOPS, peak_flops_label = estimate_device_peak_flops(device.index or 0)
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
 print(f"Vocab size: {vocab_size:,}")
+print(f"Peak FLOPs reference: {peak_flops_label} = {PEAK_FLOPS / 1e12:.1f} TFLOP/s")
 
 def build_model_config(depth):
     base_dim = depth * ASPECT_RATIO
@@ -651,10 +719,11 @@ while True:
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
+    achieved_tflops = num_flops_per_token * TOTAL_BATCH_SIZE / dt / 1e12
+    mfu = 100 * achieved_tflops * 1e12 / PEAK_FLOPS
     remaining = max(0, TIME_BUDGET - total_training_time)
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
+    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | tflops: {achieved_tflops:.1f} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
 
     # GC management (Python's GC causes ~500ms stalls)
     if step == 0:
@@ -682,7 +751,8 @@ with autocast_ctx:
 # Final summary
 t_end = time.time()
 startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
+steady_state_tflops = num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / 1e12 if total_training_time > 0 else 0
+steady_state_mfu = 100 * steady_state_tflops * 1e12 / PEAK_FLOPS if total_training_time > 0 else 0
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
@@ -690,6 +760,7 @@ print(f"val_bpb:          {val_bpb:.6f}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
+print(f"tflops:           {steady_state_tflops:.2f}")
 print(f"mfu_percent:      {steady_state_mfu:.2f}")
 print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
