@@ -1,2 +1,3 @@
 commit	val_bpb	memory_gb	status	description
 b7c9ebb	0.997900	44.0	keep	baseline
+90a80f1	1.176055	8.6	keep	baseline as-is on RTX 5090
