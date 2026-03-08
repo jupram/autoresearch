@@ -506,7 +506,7 @@ def _default_device_batch_size():
     if total_gib >= 40:
         return 64
     if total_gib >= 24:
-        return 16
+        return 32
     return 8
 
 DEVICE_BATCH_SIZE = int(os.environ.get("AUTORESEARCH_DEVICE_BATCH_SIZE", str(_default_device_batch_size())))
